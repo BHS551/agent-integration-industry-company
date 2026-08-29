@@ -38,5 +38,10 @@ curl -X POST "<ApiUrl>" -H "Authorization: Bearer <token>"
 - Every resource name is a parameter (defaults are the real names), so the same template can deploy a
   parallel copy in the same account/region by overriding the `*Name` parameters.
 - Everything the stack creates is tracked by CloudFormation and tagged with the `Project` parameter.
-- The Bedrock AgentCore agent runtime runs a container image that must be built and pushed to ECR
-  separately (see the commented section in `template.yaml`); the template provisions its execution role.
+- The **Bedrock AgentCore runtime is created by the template** (`DeployAgent=true`, the default). It runs
+  a container image (`AgentImageUri`) that is a build artifact — the template does **not** build it; build
+  and push it with the AgentCore starter toolkit (`agentcore launch`) or keep the existing one. Creating
+  the runtime requires `bedrock-agentcore` permissions. Set `DeployAgent=false` to deploy only the
+  serverless layer (API + Lambda + secret + IAM).
+- The agent's container invokes the Lambda tool **by name**, so `LambdaFunctionName` must match the name
+  the image was built against (default `lambda-saludo`). That is why the default is kept as-is.
