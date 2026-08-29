@@ -78,11 +78,6 @@ Parameters:
     Default: companydb
     Description: Logical database name to query.
 
-  RoutePath:
-    Type: String
-    Default: /products
-    Description: HTTP route the Lambda is exposed on.
-
 Conditions:
   HasDbCluster: !Not [!Equals [!Ref DbClusterArn, ""]]
   HasDbSecret: !Not [!Equals [!Ref DbSecretArn, ""]]
@@ -161,7 +156,7 @@ Resources:
           Type: HttpApi
           Properties:
             ApiId: !Ref QueryApi
-            Path: !Ref RoutePath
+            Path: /products     # SAM requires a literal path here (no intrinsics)
             Method: ANY
       InlineCode: |
         import json
@@ -287,7 +282,7 @@ Resources:
 Outputs:
   ApiUrl:
     Description: Public endpoint for the HTTP query path.
-    Value: !Sub "https://${QueryApi}.execute-api.${AWS::Region}.amazonaws.com${RoutePath}"
+    Value: !Sub "https://${QueryApi}.execute-api.${AWS::Region}.amazonaws.com/products"
   FunctionName:
     Description: Name of the data-query Lambda tool.
     Value: !Ref QueryFunction
