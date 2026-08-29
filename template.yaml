@@ -2,37 +2,33 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 
 Description: >
-  Data-query integration (IaC, single file). Stands up, from zero:
-  an HTTP API + a Lambda "data query" tool that returns records via the RDS Data
-  API, the Bearer-token secret it validates, the Lambda IAM, and the execution
-  role for the Bedrock AgentCore assistant that calls the Lambda as a tool.
+  Data-query integration: an HTTP API + a Lambda tool that returns records via
+  the RDS Data API, its Bearer-token secret, the Lambda IAM, and the execution
+  role for a Bedrock AgentCore assistant. All resource names are parameters
+  (defaults are the real names) so the same template can deploy a parallel,
+  fully tracked copy in the same account/region. The database is NOT created here.
 
-  Every resource name is a Parameter (defaults are the real production names), so
-  the same template can deploy a parallel copy in the same account/region by
-  overriding the *Name parameters. Everything it creates is tracked by the
-  CloudFormation stack and tagged with the Project parameter.
-
-  The DATABASE IS NOT CREATED HERE (bring your own data source: an existing
-  Aurora cluster reachable by the RDS Data API, or wire it later). Pass its ARNs
-  as parameters; leave them empty to deploy the API/Lambda skeleton first.
-
-  ---------------------------------------------------------------------------
-  DEPLOY (easiest path) — with the SAM CLI:
-      sam deploy --guided
-
-  Or WITHOUT the SAM CLI (the Serverless transform runs server-side):
-      aws cloudformation deploy \
-        --template-file template.yaml \
-        --stack-name data-query \
-        --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-        --parameter-overrides ApiToken=<your-token> \
-                              DbClusterArn=<aurora-cluster-arn> \
-                              DbSecretArn=<db-credentials-secret-arn> \
-                              DbName=companydb
-
-  The stack Outputs print the public endpoint. Test:
-      curl -X POST "<ApiUrl>" -H "Authorization: Bearer <your-token>"
-  ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DEPLOY (easiest path) — with the SAM CLI:
+#     sam deploy --guided
+#
+# Or WITHOUT the SAM CLI (the Serverless transform runs server-side):
+#     aws cloudformation deploy \
+#       --template-file template.yaml \
+#       --stack-name data-query \
+#       --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+#       --parameter-overrides ApiToken=<your-token> \
+#                             DbClusterArn=<aurora-cluster-arn> \
+#                             DbSecretArn=<db-credentials-secret-arn> \
+#                             DbName=companydb
+#
+# The stack Outputs print the public endpoint. Test:
+#     curl -X POST "<ApiUrl>" -H "Authorization: Bearer <your-token>"
+#
+# The DATABASE IS NOT CREATED HERE — bring your own data source (an existing
+# Aurora cluster reachable by the RDS Data API), or leave the Db* params empty
+# to deploy the API/Lambda skeleton first.
+# ---------------------------------------------------------------------------
 
 Parameters:
   ApiToken:
