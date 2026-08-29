@@ -74,9 +74,40 @@ Parameters:
     Default: companydb
     Description: Logical database name to query.
 
+  # ---- Bedrock AgentCore assistant ----
+  DeployAgent:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Whether to create the Bedrock AgentCore runtime. Requires bedrock-agentcore
+      permissions and an existing container image (see AgentImageUri). Set to
+      "false" to deploy only the serverless layer (API + Lambda + secret + IAM).
+  AgentImageUri:
+    Type: String
+    Default: 780817326479.dkr.ecr.us-east-1.amazonaws.com/agente-saludo:latest
+    Description: >
+      ECR URI of the assistant's container image. The image is a build artifact,
+      not created by this template; build/push it with the AgentCore starter
+      toolkit (agentcore launch) or keep the existing one. The image invokes the
+      Lambda tool by the name in LambdaFunctionName, so keep them consistent.
+  AgentRuntimeName:
+    Type: String
+    Default: data_assistant
+    Description: Name of the AgentCore runtime (letters, digits, underscore).
+  AgentProtocol:
+    Type: String
+    Default: HTTP
+    AllowedValues: ["MCP", "HTTP", "A2A", "AGUI"]
+  AgentNetworkMode:
+    Type: String
+    Default: PUBLIC
+    AllowedValues: ["PUBLIC", "VPC"]
+
 Conditions:
   HasDbCluster: !Not [!Equals [!Ref DbClusterArn, ""]]
   HasDbSecret: !Not [!Equals [!Ref DbSecretArn, ""]]
+  WithAgent: !Equals [!Ref DeployAgent, "true"]
 
 Globals:
   Function:
@@ -250,30 +281,25 @@ Resources:
                   - ecr:GetAuthorizationToken
                 Resource: "*"
 
-  # ---------------------------------------------------------------------------
-  # OPTIONAL — the Bedrock AgentCore runtime itself.
-  # It runs a CONTAINER IMAGE that must be built and pushed to ECR first; no IaC
-  # can build that image for you. Easiest path is the AgentCore starter toolkit:
-  #     pip install bedrock-agentcore-starter-toolkit
-  #     agentcore configure --entrypoint agent.py \
-  #         --execution-role <AssistantExecutionRoleArn output>
-  #     agentcore launch          # builds, pushes to ECR, creates the runtime
-  #
-  # Or, once you HAVE an image URI, declare the runtime here and uncomment.
-  # (Field names follow the AWS::BedrockAgentCore::Runtime schema; adjust to the
-  #  version available in your region.)
-  #
-  # AssistantRuntime:
-  #   Type: AWS::BedrockAgentCore::Runtime
-  #   Properties:
-  #     AgentRuntimeName: data-assistant
-  #     RoleArn: !GetAtt AssistantExecutionRole.Arn
-  #     NetworkConfiguration:
-  #       NetworkMode: PUBLIC
-  #     AgentRuntimeArtifact:
-  #       ContainerConfiguration:
-  #         ContainerUri: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/data-assistant:latest
-  # ---------------------------------------------------------------------------
+  # --- The Bedrock AgentCore runtime (the assistant) ---
+  # Runs the agent CONTAINER IMAGE (AgentImageUri). The image is a build artifact,
+  # NOT created by this template: build/push it with the AgentCore starter toolkit
+  # (`agentcore launch`) or keep the existing one. Creating this resource requires
+  # bedrock-agentcore permissions; set DeployAgent=false to skip it.
+  # The image invokes the Lambda tool BY NAME (LambdaFunctionName) — that is why
+  # the default is kept as the real name the image was built against.
+  AssistantRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: WithAgent
+    Properties:
+      AgentRuntimeName: !Ref AgentRuntimeName
+      RoleArn: !GetAtt AssistantExecutionRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref AgentImageUri
+      NetworkConfiguration:
+        NetworkMode: !Ref AgentNetworkMode
+      ProtocolConfiguration: !Ref AgentProtocol
 
 Outputs:
   ApiUrl:
@@ -289,5 +315,9 @@ Outputs:
     Description: ARN of the Bearer-token secret.
     Value: !Ref QueryApiToken
   AssistantExecutionRoleArn:
-    Description: Pass this to `agentcore configure --execution-role` when deploying the agent.
+    Description: Execution role the AgentCore runtime assumes (invoke Lambda + Bedrock).
     Value: !GetAtt AssistantExecutionRole.Arn
+  AgentRuntimeArn:
+    Condition: WithAgent
+    Description: ARN of the Bedrock AgentCore runtime.
+    Value: !GetAtt AssistantRuntime.AgentRuntimeArn
