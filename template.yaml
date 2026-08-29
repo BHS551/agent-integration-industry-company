@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Data-query integration (IaC, single file). Stands up, from zero:
+  an HTTP API + a Lambda "data query" tool that returns records via the RDS Data
+  API, the Bearer-token secret it validates, the Lambda IAM, and the execution
+  role for the Bedrock AgentCore assistant that calls the Lambda as a tool.
+
+  The DATABASE IS NOT CREATED HERE (bring your own data source: an existing
+  Aurora cluster reachable by the RDS Data API, or wire it later). Pass its ARNs
+  as parameters; leave them empty to deploy the API/Lambda skeleton first.
+
+  ---------------------------------------------------------------------------
+  DEPLOY (easiest path) — with the SAM CLI:
+      sam deploy --guided
+
+  Or WITHOUT the SAM CLI (the Serverless transform runs server-side):
+      aws cloudformation deploy \
+        --template-file template.yaml \
+        --stack-name data-query \
+        --capabilities CAPABILITY_IAM \
+        --parameter-overrides ApiToken=<your-token> \
+                              DbClusterArn=<aurora-cluster-arn> \
+                              DbSecretArn=<db-credentials-secret-arn> \
+                              DbName=companydb
+
+  The stack Outputs print the public endpoint. Test:
+      curl -X POST "<ApiUrl>" -H "Authorization: Bearer <your-token>"
+  ---------------------------------------------------------------------------
+
+Parameters:
+  ApiToken:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: 'Bearer token clients must send it in the Authorization header as: Bearer <token>.'
+
+  DbClusterArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the Aurora cluster the Lambda queries via the RDS Data API.
+      Leave empty to deploy without a data source (queries will error until set).
+
+  DbSecretArn:
+    Type: String
+    Default: ""
+    Description: ARN of the Secrets Manager secret with the DB credentials (used by the RDS Data API).
+
+  DbName:
+    Type: String
+    Default: companydb
+    Description: Logical database name to query.
+
+  ApiName:
+    Type: String
+    Default: data-query-api
+
+  RoutePath:
+    Type: String
+    Default: /products
+    Description: HTTP route the Lambda is exposed on.
+
+Conditions:
+  HasDbCluster: !Not [!Equals [!Ref DbClusterArn, ""]]
+  HasDbSecret: !Not [!Equals [!Ref DbSecretArn, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 256
+    Architectures: [x86_64]
+
+Resources:
+
+  # --- Bearer token used by the HTTP path (validated inside the Lambda) ---
+  QueryApiToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: query-api-token
+      Description: Bearer token for the HTTP query endpoint.
+      SecretString: !Sub '{"token":"${ApiToken}"}'
+
+  # --- HTTP API (data-query-api) ---
+  QueryApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Ref ApiName
+      StageName: $default
+      # Auth is enforced inside the Lambda (Bearer token). No gateway authorizer.
+
+  # --- The data-query Lambda tool (shared by the HTTP API and the assistant) ---
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: data-query
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !Ref DbClusterArn
+          DB_SECRET_ARN: !Ref DbSecretArn
+          DB_NAME: !Ref DbName
+          TOKEN_SECRET: !Ref QueryApiToken   # secret ARN; GetSecretValue accepts an ARN
+      Policies:
+        - Statement:
+            - Sid: DataAPI
+              Effect: Allow
+              Action:
+                - rds-data:ExecuteStatement
+                - rds-data:BatchExecuteStatement
+                - rds-data:BeginTransaction
+                - rds-data:CommitTransaction
+                - rds-data:RollbackTransaction
+              # Scoped to the cluster when provided; "*" is a placeholder until you set DbClusterArn.
+              Resource: !If [HasDbCluster, !Ref DbClusterArn, "*"]
+            - Sid: ReadTokenSecret
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref QueryApiToken
+            - !If
+              - HasDbSecret
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecretArn
+              - !Ref AWS::NoValue
+      Events:
+        Query:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref QueryApi
+            Path: !Ref RoutePath
+            Method: ANY
+      InlineCode: |
+        import json
+        import os
+        import boto3
+
+        # Company data lookup via the RDS Data API (HTTPS, no VPC, no driver).
+        REGION = os.environ.get("AWS_REGION", "us-east-1")
+        CLUSTER_ARN = os.environ.get("DB_CLUSTER_ARN", "")
+        DB_SECRET_ARN = os.environ.get("DB_SECRET_ARN", "")
+        DB_NAME = os.environ.get("DB_NAME", "companydb")
+        TOKEN_SECRET = os.environ["TOKEN_SECRET"]
+
+        rds_data = boto3.client("rds-data", region_name=REGION)
+        secrets_client = boto3.client("secretsmanager", region_name=REGION)
+
+
+        def list_products():
+            """Business logic: return the product list. Shared by the assistant and the HTTP API."""
+            resp = rds_data.execute_statement(
+                resourceArn=CLUSTER_ARN,
+                secretArn=DB_SECRET_ARN,
+                database=DB_NAME,
+                sql="SELECT name FROM products ORDER BY name",
+            )
+            return [col[0].get("stringValue") for col in resp.get("records", [])]
+
+
+        def valid_token(received):
+            secret = secrets_client.get_secret_value(SecretId=TOKEN_SECRET)
+            return received == json.loads(secret["SecretString"])["token"]
+
+
+        def lambda_handler(event, context):
+            is_http = "headers" in event and event.get("requestContext", {}).get("http") is not None
+
+            if is_http:
+                # From API Gateway -> validate the bearer token
+                headers = event.get("headers", {}) or {}
+                auth = headers.get("authorization") or headers.get("Authorization", "")
+                received = auth.replace("Bearer ", "").strip()
+                if not received or not valid_token(received):
+                    return {"statusCode": 401, "body": json.dumps({"error": "Missing or invalid token"})}
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"products": list_products()}),
+                }
+
+            # Direct invocation (assistant/LLM) -> access already enforced by IAM.
+            return {"products": list_products()}
+
+  # --- Execution role for the Bedrock AgentCore assistant (the agent uses this) ---
+  # The agent invokes the Lambda tool directly (IAM) and calls a Bedrock model.
+  AssistantExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: data-assistant-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-tool-and-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeQueryTool
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt QueryFunction.Arn
+              - Sid: InvokeModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: PullAgentImage
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL — the Bedrock AgentCore runtime itself.
+  # It runs a CONTAINER IMAGE that must be built and pushed to ECR first; no IaC
+  # can build that image for you. Easiest path is the AgentCore starter toolkit:
+  #     pip install bedrock-agentcore-starter-toolkit
+  #     agentcore configure --entrypoint agent.py \
+  #         --execution-role <AssistantExecutionRoleArn output>
+  #     agentcore launch          # builds, pushes to ECR, creates the runtime
+  #
+  # Or, once you HAVE an image URI, declare the runtime here and uncomment.
+  # (Field names follow the AWS::BedrockAgentCore::Runtime schema; adjust to the
+  #  version available in your region.)
+  #
+  # AssistantRuntime:
+  #   Type: AWS::BedrockAgentCore::Runtime
+  #   Properties:
+  #     AgentRuntimeName: data-assistant
+  #     RoleArn: !GetAtt AssistantExecutionRole.Arn
+  #     NetworkConfiguration:
+  #       NetworkMode: PUBLIC
+  #     AgentRuntimeArtifact:
+  #       ContainerConfiguration:
+  #         ContainerUri: <ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/data-assistant:latest
+  # ---------------------------------------------------------------------------
+
+Outputs:
+  ApiUrl:
+    Description: Public endpoint for the HTTP query path.
+    Value: !Sub "https://${QueryApi}.execute-api.${AWS::Region}.amazonaws.com${RoutePath}"
+  FunctionName:
+    Description: Name of the data-query Lambda tool.
+    Value: !Ref QueryFunction
+  FunctionArn:
+    Description: ARN of the data-query Lambda tool (use it as the assistant's tool).
+    Value: !GetAtt QueryFunction.Arn
+  TokenSecretArn:
+    Description: ARN of the Bearer-token secret.
+    Value: !Ref QueryApiToken
+  AssistantExecutionRoleArn:
+    Description: Pass this to `agentcore configure --execution-role` when deploying the agent.
+    Value: !GetAtt AssistantExecutionRole.Arn
