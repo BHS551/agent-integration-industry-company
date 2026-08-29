@@ -2,65 +2,77 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 
 Description: >
-  Data-query integration (IaC, single file). Stands up, from zero:
-  an HTTP API + a Lambda "data query" tool that returns records via the RDS Data
-  API, the Bearer-token secret it validates, the Lambda IAM, and the execution
-  role for the Bedrock AgentCore assistant that calls the Lambda as a tool.
+  Data-query integration: an HTTP API + a Lambda tool that returns records via
+  the RDS Data API, its Bearer-token secret, the Lambda IAM, and the execution
+  role for a Bedrock AgentCore assistant. All resource names are parameters
+  (defaults are the real names) so the same template can deploy a parallel,
+  fully tracked copy in the same account/region. The database is NOT created here.
 
-  The DATABASE IS NOT CREATED HERE (bring your own data source: an existing
-  Aurora cluster reachable by the RDS Data API, or wire it later). Pass its ARNs
-  as parameters; leave them empty to deploy the API/Lambda skeleton first.
-
-  ---------------------------------------------------------------------------
-  DEPLOY (easiest path) — with the SAM CLI:
-      sam deploy --guided
-
-  Or WITHOUT the SAM CLI (the Serverless transform runs server-side):
-      aws cloudformation deploy \
-        --template-file template.yaml \
-        --stack-name data-query \
-        --capabilities CAPABILITY_IAM \
-        --parameter-overrides ApiToken=<your-token> \
-                              DbClusterArn=<aurora-cluster-arn> \
-                              DbSecretArn=<db-credentials-secret-arn> \
-                              DbName=companydb
-
-  The stack Outputs print the public endpoint. Test:
-      curl -X POST "<ApiUrl>" -H "Authorization: Bearer <your-token>"
-  ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DEPLOY (easiest path) — with the SAM CLI:
+#     sam deploy --guided
+#
+# Or WITHOUT the SAM CLI (the Serverless transform runs server-side):
+#     aws cloudformation deploy \
+#       --template-file template.yaml \
+#       --stack-name data-query \
+#       --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+#       --parameter-overrides ApiToken=<your-token> \
+#                             DbClusterArn=<aurora-cluster-arn> \
+#                             DbSecretArn=<db-credentials-secret-arn> \
+#                             DbName=companydb
+#
+# The stack Outputs print the public endpoint. Test:
+#     curl -X POST "<ApiUrl>" -H "Authorization: Bearer <your-token>"
+#
+# The DATABASE IS NOT CREATED HERE — bring your own data source (an existing
+# Aurora cluster reachable by the RDS Data API), or leave the Db* params empty
+# to deploy the API/Lambda skeleton first.
+# ---------------------------------------------------------------------------
 
 Parameters:
   ApiToken:
     Type: String
     NoEcho: true
     MinLength: 1
-    Description: 'Bearer token clients must send it in the Authorization header as: Bearer <token>.'
+    Description: "Bearer token clients must send it in the Authorization header as: Bearer <token>."
 
+  # ---- Resource names (parameterized; defaults are the real production names) ----
+  LambdaFunctionName:
+    Type: String
+    Default: lambda-saludo
+    Description: >
+      Name of the data-query Lambda tool. Default is the REAL name the assistant
+      invokes by (kept for compatibility). Override for a parallel copy.
+  ApiName:
+    Type: String
+    Default: data-query-api
+  TokenSecretName:
+    Type: String
+    Default: query-api-token
+  AssistantRoleName:
+    Type: String
+    Default: data-assistant-exec
+  ProjectTag:
+    Type: String
+    Default: data-query
+    Description: Value of the "Project" tag applied to every resource, for tracking.
+
+  # ---- Data source (NOT created here) ----
   DbClusterArn:
     Type: String
     Default: ""
     Description: >
       ARN of the Aurora cluster the Lambda queries via the RDS Data API.
       Leave empty to deploy without a data source (queries will error until set).
-
   DbSecretArn:
     Type: String
     Default: ""
     Description: ARN of the Secrets Manager secret with the DB credentials (used by the RDS Data API).
-
   DbName:
     Type: String
     Default: companydb
     Description: Logical database name to query.
-
-  ApiName:
-    Type: String
-    Default: data-query-api
-
-  RoutePath:
-    Type: String
-    Default: /products
-    Description: HTTP route the Lambda is exposed on.
 
 Conditions:
   HasDbCluster: !Not [!Equals [!Ref DbClusterArn, ""]]
@@ -72,6 +84,9 @@ Globals:
     Timeout: 15
     MemorySize: 256
     Architectures: [x86_64]
+    Tags:
+      Project: !Ref ProjectTag
+      ManagedBy: cloudformation
 
 Resources:
 
@@ -79,9 +94,12 @@ Resources:
   QueryApiToken:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: query-api-token
+      Name: !Ref TokenSecretName
       Description: Bearer token for the HTTP query endpoint.
       SecretString: !Sub '{"token":"${ApiToken}"}'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: ManagedBy, Value: cloudformation }
 
   # --- HTTP API (data-query-api) ---
   QueryApi:
@@ -90,12 +108,15 @@ Resources:
       Name: !Ref ApiName
       StageName: $default
       # Auth is enforced inside the Lambda (Bearer token). No gateway authorizer.
+      Tags:
+        Project: !Ref ProjectTag
+        ManagedBy: cloudformation
 
   # --- The data-query Lambda tool (shared by the HTTP API and the assistant) ---
   QueryFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: data-query
+      FunctionName: !Ref LambdaFunctionName
       Handler: index.lambda_handler
       Environment:
         Variables:
@@ -131,7 +152,7 @@ Resources:
           Type: HttpApi
           Properties:
             ApiId: !Ref QueryApi
-            Path: !Ref RoutePath
+            Path: /products     # SAM requires a literal path here (no intrinsics)
             Method: ANY
       InlineCode: |
         import json
@@ -189,7 +210,10 @@ Resources:
   AssistantExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: data-assistant-exec
+      RoleName: !Ref AssistantRoleName
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag }
+        - { Key: ManagedBy, Value: cloudformation }
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -254,7 +278,7 @@ Resources:
 Outputs:
   ApiUrl:
     Description: Public endpoint for the HTTP query path.
-    Value: !Sub "https://${QueryApi}.execute-api.${AWS::Region}.amazonaws.com${RoutePath}"
+    Value: !Sub "https://${QueryApi}.execute-api.${AWS::Region}.amazonaws.com/products"
   FunctionName:
     Description: Name of the data-query Lambda tool.
     Value: !Ref QueryFunction
